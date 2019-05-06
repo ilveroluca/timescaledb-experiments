@@ -8,6 +8,7 @@ import json
 import os
 import psycopg2
 import psycopg2.extras  # need to import this explicitly
+import random
 import statistics
 import sys
 import threading
@@ -129,6 +130,31 @@ class Monitor(object):
         return type(self).TimingBlock(self, event_name)
 
 
+@contextlib.contextmanager
+def quick_cursor(db_connection_params, commit=False):
+    logging.debug("Connecting to DB")
+    conn = psycopg2.connect(
+        host=db_connection_params.host,
+        port=db_connection_params.port,
+        dbname=db_connection_params.dbname,
+        user=db_connection_params.username,
+        password=db_connection_params.password)
+    try:
+        yield conn.cursor()
+    finally:
+        if commit:
+            conn.commit()
+        conn.close()
+
+
+def pretty_print_json_results(json_filename):
+    with open(json_filename) as f:
+        data = json.load(f)
+    for element in data:
+        m = Monitor().load_from_dict(element)
+        print(m.write_summary())
+
+
 class JsonLineFileInputReader(object):
     def __init__(self, queue, files=None, batch_size=5000, repeat_input_times=1):
         self._queue = queue
@@ -186,9 +212,25 @@ class JsonLineFileInputReader(object):
         return self._monitor
 
 
-class DBIngester(object):
-    def __init__(self, db_connection_params, q):
-        self._q = q
+class DBSchema(object):
+    def __init__(self, creation_sql):
+        self._create_sql = creation_sql
+        self._queries = dict()
+
+    def create(self, cur):
+        logging.info("Executing schema SQL")
+        cur.execute(self._create_sql)
+
+    def add_query(self, name, sql):
+        self._queries[name] = sql
+
+    def iterqueries(self):
+        for name, sql in self._queries.items():
+            yield name, sql
+
+
+class DBOperator(object):
+    def __init__(self, db_connection_params):
         self._conn = psycopg2.connect(
             host=db_connection_params.host,
             port=db_connection_params.port,
@@ -197,23 +239,20 @@ class DBIngester(object):
             password=db_connection_params.password)
         self._monitor = Monitor()
 
-    @classmethod
-    def create_schema(cls, db_connection_params):
-        logging.info("Connecting to DB")
-        conn = psycopg2.connect(
-            host=db_connection_params.host,
-            port=db_connection_params.port,
-            dbname=db_connection_params.dbname,
-            user=db_connection_params.username,
-            password=db_connection_params.password)
-        try:
-            logging.info("Executing schema SQL")
-            with conn.cursor() as cur:
-                cur.execute(cls.schema_sql())
-            conn.commit()
-            logging.info("Tables created")
-        finally:
-            conn.close()
+    def close(self):
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def get_monitor(self):
+        return self._monitor
+
+
+class DBIngester(DBOperator, threading.Thread):
+    def __init__(self, db_connection_params, q):
+        DBOperator.__init__(self, db_connection_params)
+        threading.Thread.__init__(self)
+        self._q = q
 
     def write(self):
         try:
@@ -232,45 +271,78 @@ class DBIngester(object):
         finally:
             self._conn.close()
 
+    def run(self):
+        try:
+            self.write()
+        except Exception as e:
+            self._monitor.exception = e
+            raise
+
     def _insert_batch(self, batch):
         raise NotImplementedError()
-
-    def get_monitor(self):
-        return self._monitor
-
-
-@contextlib.contextmanager
-def quick_cursor(db_connection_params):
-    logging.debug("Connecting to DB")
-    conn = psycopg2.connect(
-        host=db_connection_params.host,
-        port=db_connection_params.port,
-        dbname=db_connection_params.dbname,
-        user=db_connection_params.username,
-        password=db_connection_params.password)
-    try:
-        yield conn.cursor()
-    finally:
-        conn.close()
-
-
-def pretty_print_json_results(json_filename):
-    with open(json_filename) as f:
-        data = json.load(f)
-    for element in data:
-        m = Monitor().load_from_dict(element)
-        print(m.write_summary())
 
 
 class DBIngesterSchemaJson(DBIngester):
     @classmethod
+    def get_schema(cls):
+        schema = DBSchema(cls.schema_sql())
+
+        q = dict()
+        q['reading_types'] = """
+            select x from source, jsonb_to_recordset(source.fields) as x(type text, fieldname text) group by x;
+        """
+
+        q['sources'] = """
+            select
+                source_serial_no,
+                x.fieldname,
+                description
+            from source, jsonb_to_recordset(source.fields) as x(type text, fieldname text);
+        """
+
+        q['active_sources_in_area'] = """
+            select source_serial_no
+            from source s
+            where exists(
+              select source_serial_no
+              from reading r join source s using (source_serial_no)
+              where
+                  r.time >= '2019-04-17 20:00:00' and r.time < '2019-04-18 20:00:00'
+                  and ST_Distance(s.geom, ST_SetSRID(ST_MakePoint(9, 39),3003)) < 0.2);
+        """
+
+        q['source_timeseries'] = """
+            select
+                time, r.source_serial_no, (data->>'environment.humidity')::real
+            from reading r
+            where
+                source_serial_no = 'probe-8'
+                and r.time >= '2019-04-17 20:00:00' and r.time < '2019-04-18 20:00:00';
+        """
+
+        q['source_timebucket'] = """
+            select time_bucket('5 minute', time) AS five_min, avg((data->>'environment.humidity')::real)
+            from reading r
+            where
+                source_serial_no = 'probe-8'
+                and r.time >= '2019-04-17 20:00:00' and r.time < '2019-04-18 20:00:00'
+            GROUP BY five_min;
+        """
+
+        for name, sql in q.items():
+            schema.add_query(name, sql)
+
+        return schema
+
     def schema_sql():
-        return """
-    CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+        q = """
     drop table if exists reading cascade;
+    drop table if exists source_reading_type cascade;
     drop table if exists source cascade;
     drop table if exists reading_type cascade;
     drop table if exists reading_category cascade;
+    CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+    CREATE EXTENSION IF NOT EXISTS postgis CASCADE;
 
     create table reading_category (
         category text not null,
@@ -292,51 +364,66 @@ class DBIngesterSchemaJson(DBIngester):
         ('environment', 'ambient_temperature'),
         ('environment', 'photosensor');
 
-
     create table source (
-        source_id text not null primary key
+        source_serial_no text not null,
+        fields jsonb not null,
+        geom geometry,
+        description jsonb,
+        primary key (source_serial_no)
+    );
+
+    create table source_reading_type (
+        source_serial_no text not null references source,
+        reading_category text not null,
+        reading_type text not null,
+        primary key (source_serial_no, reading_category, reading_type),
+        foreign key (reading_category, reading_type) references reading_type(category, reading_type)
     );
 
     create table reading (
         time timestamp(0) not null,
-        source_id text not null references source,
+        source_serial_no text not null references source,
         data jsonb,
         tiledb text,
         tiledb_coord text,
         constraint check_payload check (data is not null or (tiledb is not null and tiledb_coord is not null))
     );
-    insert into source (source_id) values
-        ('probe-0'),
-        ('probe-1'),
-        ('probe-2'),
-        ('probe-3'),
-        ('probe-4'),
-        ('probe-5'),
-        ('probe-6'),
-        ('probe-7'),
-        ('probe-8'),
-        ('probe-9'),
-        ('probe-a'),
-        ('probe-b'),
-        ('probe-c'),
-        ('probe-d'),
-        ('probe-e'),
-        ('probe-f');
 
     --select create_hypertable('reading', 'time', chunk_time_interval => interval '1 day');
     select create_hypertable('reading', 'time', create_default_indexes => false, chunk_time_interval => interval '1 day');
-    create index on reading (source_id, time DESC);
+    create index on reading (source_serial_no, time DESC);
         """
+        n_sources = 16
+        q += "insert into source (source_serial_no, fields, geom) values "
+        rtypes = [ 'environment.humidity', 'environment.radiation_level', 'environment.ambient_temperature', 'environment.photosensor' ]
+        field_spec = json.dumps([ { 'fieldname': n, "type": "real" } for n in rtypes ])
+        values = [
+            """('probe-{:x}', '{}', ST_GeomFromText('POINT({:0.6f} {:0.6f})', 3003))""".format(
+                n, field_spec, 9 + n / 100, 39 + n / 100)
+            for n in range(n_sources)
+        ]
+        q += ",\n".join(values) + ";\n"
+
+        q += "insert into source_reading_type (source_serial_no, reading_category, reading_type) values"
+        values = [
+            """('probe-{:x}', '{}', '{}')""".format(n, *r_type.split('.'))
+            for n in range(n_sources) for r_type in rtypes
+        ]
+        q += ",\n".join(values) + ";\n"
+        return q
 
     def _insert_batch(self, batch):
         logging.debug("Inserting DBIngesterSchemaJson batch")
 
         def _make_tuple(item):
             ts = item.pop('timestamp')
-            sensor = item.pop('sensor_uuid')
-            return (ts, sensor, psycopg2.extras.Json(item))
+            sensor = item.pop('sensor_uuid')[0:7]  # take the first 7 characters to make an id like 'probe-a'
+            new_item = {}
+            for k, v in item.items():
+                new_item['environment.' + k] = v  # prepend category 'environment'
+            return (ts, sensor, psycopg2.extras.Json(new_item))
 
-        sql = "insert into reading (time, source_id, data) values %s"
+        sql = "insert into reading (time, source_serial_no, data) values %s"
         tuples = [ _make_tuple(item) for item in batch ]
         template = "(to_timestamp(%s), %s, %s)"
         with self._monitor.time_block("insert query time"):
@@ -346,13 +433,71 @@ class DBIngesterSchemaJson(DBIngester):
 
 
 class DBIngesterSchemaValues(DBIngester):
+    @classmethod
+    def get_schema(cls):
+        schema = DBSchema(cls.schema_sql())
+
+        q = dict()
+        q['reading_types'] = """
+            select category || '.' || reading_type from reading_type;
+        """
+
+        q['sources'] = """
+            select
+                source_serial_no,
+                reading_category,
+                reading_type,
+                description
+            from source;
+        """
+
+        q['active_sources_in_area'] = """
+            select source_serial_no
+            from source s
+            where exists(
+              select source_serial_no
+              from reading r join source s using (source_serial_no)
+              where
+                  r.time >= '2019-04-17 20:00:00' and r.time < '2019-04-18 20:00:00'
+                  and ST_Distance(s.geom, ST_SetSRID(ST_MakePoint(9, 39),3003)) < 0.2);
+        """
+
+        q['source_timeseries'] = """
+            select
+                time, r.source_serial_no, value
+            from reading r
+            join source s using (source_serial_no)
+            where
+                source_serial_no = 'probe-8-h'
+                and r.time >= '2019-04-17 20:00:00' and r.time < '2019-04-18 20:00:00';
+        """
+
+        q['source_timebucket'] = """
+            select time_bucket('5 minute', time) AS five_min, avg(value)
+            from reading r
+            where
+                source_serial_no = 'probe-8-h'
+                and r.time >= '2019-04-17 20:00:00' and r.time < '2019-04-18 20:00:00'
+            GROUP BY five_min;
+        """
+
+        for name, sql in q.items():
+            schema.add_query(name, sql)
+
+        return schema
+
+# max time 2019-04-19 08:41:18
+# min time 2019-04-17 16:41:10
+
     def schema_sql():
         q = """
-    CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
     drop table if exists reading cascade;
     drop table if exists source cascade;
+    drop table if exists source_reading_type cascade;
     drop table if exists reading_type cascade;
     drop table if exists reading_category cascade;
+    CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+    CREATE EXTENSION IF NOT EXISTS postgis CASCADE;
 
     create table reading_category (
         category text not null,
@@ -374,17 +519,20 @@ class DBIngesterSchemaValues(DBIngester):
         ('environment', 'ambient_temperature'),
         ('environment', 'photosensor');
 
+
     create table source (
-        source_id text not null,
+        source_serial_no text not null,
         reading_category text not null,
         reading_type text not null,
-        primary key (source_id),
+        geom geometry,
+        description jsonb,
+        primary key (source_serial_no),
         foreign key (reading_category, reading_type) references reading_type(category, reading_type)
     );
 
     create table reading (
         time timestamp(0) not null,
-        source_id text not null references source,
+        source_serial_no text not null references source,
         value real,
         tiledb text,
         tiledb_coord text,
@@ -393,11 +541,15 @@ class DBIngesterSchemaValues(DBIngester):
 
     --select create_hypertable('reading', 'time', chunk_time_interval => interval '1 day');
     select create_hypertable('reading', 'time', create_default_indexes => false, chunk_time_interval => interval '1 day');
-    create index on reading (source_id, time DESC);
-    insert into source (source_id, reading_category, reading_type) values
+    create index on reading (source_serial_no, time DESC);
+    insert into source (source_serial_no, reading_category, reading_type, geom) values
         """
         rtypes = [ 'humidity', 'radiation_level', 'ambient_temperature', 'photosensor' ]
-        sources = [ "('probe-{:x}-{}', 'environment', '{}')".format(n, t[0:1], t) for n in range(16) for t in rtypes ]
+        sources = [
+            "('probe-{:x}-{}', 'environment', '{}', ST_GeomFromText('POINT({:0.6f} {:0.6f})', 3003))".format(
+                n, t[0:1], t, 9 + n / 100, 39 + n / 100)
+            for n in range(16) for t in rtypes
+        ]
         q += ",\n".join(sources) + ";"
         return q
 
@@ -409,13 +561,92 @@ class DBIngesterSchemaValues(DBIngester):
             sensor = item.pop('sensor_uuid')
             return [ (ts, "{}-{}".format(sensor, key[0:1]), value) for key, value in item.items() ]
 
-        sql = "insert into reading (time, source_id, value) values %s"
+        sql = "insert into reading (time, source_serial_no, value) values %s"
         tuples = [ t for item in batch for t in _make_tuples(item) ]
         template = "(to_timestamp(%s), %s, %s)"
         with self._monitor.time_block("insert query time"):
             with self._conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, sql, tuples, template=template, page_size=500)
             self._conn.commit()
+
+
+class QueryOperator(DBOperator, threading.Thread):
+    def __init__(self, db_connection_params, schema_obj):
+        DBOperator.__init__(self, db_connection_params)
+        threading.Thread.__init__(self)
+        self._schema_obj = schema_obj
+        self._run = True
+        self._interval = db_connection_params.query_interval
+        self._stop_event = threading.Event()
+
+    @property
+    def interval(self):
+        return self._interval
+
+    @interval.setter
+    def set_interval(self, v):
+        if v <= 0:
+            raise ValueError("sleep interval must be > 0")
+        self._interval = v
+
+    def stop(self):
+        logging.debug("QueryOperator.stop()")
+        self._run = False
+        self._stop_event.set()
+
+    def _do_work(self):
+        logging.debug("Query operator starting")
+        while self._run:
+            for name, sql in self._schema_obj.iterqueries():
+                if not self._run:
+                    break
+                with self._monitor.time_block("query_" + name):
+                    with self._conn.cursor() as cur:
+                        logging.debug("Running %s query", name)
+                        cur.execute(sql)
+                        # fetch records
+                        rows = cur.fetchall()  # brutally risky, but I think it'll be ok for our tests
+                        logging.info("Fetched %s rows", len(rows))
+                        rows = None
+                self._stop_event.wait(self._interval)
+        logging.debug("Query operator exiting")
+
+    def run(self):
+        try:
+            self._do_work()
+        except Exception as e:
+            self._monitor.exception = e
+            raise
+
+
+def report_table_sizes(db_conn_options, monitor):
+    logging.debug("Getting table and index sizes from DB")
+    with quick_cursor(db_conn_options) as cur:
+        size_threshold = 1000000  # we filter all relations and indexes smaller than this value
+        query = """
+            SELECT nspname || '.' || relname AS "relation",
+                 pg_relation_size(C.oid) AS "size"
+               FROM pg_class C
+               LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
+               WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > {}
+               ORDER BY pg_relation_size(C.oid) DESC;""".format(size_threshold)
+        #  WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > 1000000
+        cur.execute(query)
+        rows = cur.fetchall()
+        if len(rows) == 0:
+            logging.info("All relation sizes filtered since they are under the size threshold of %s", size_threshold)
+        for row in rows:
+            monitor.collect_value(row[0], row[1])
+        monitor.collect_value("total size", sum( r[1] for r in rows ))
+
+
+def write_output(filename, all_monitors):
+    logging.info("Writing output file %s", filename)
+    with open(filename, 'w') as f:
+        json.dump([ m.to_dict() for m in all_monitors ], f)
+
+    for monitor in all_monitors:
+        logging.info(monitor.write_summary())
 
 
 def get_ingester_class(choice_text):
@@ -443,6 +674,7 @@ def main(args):
     parser.add_argument('-r', '--repeats', metavar="N", type=int, default=1, help="how many times to repeat the input data")
     parser.add_argument('-w', '--num-writers', metavar="N", type=int, default=1, help="Number of writer threads")
     parser.add_argument('-q', '--num-query', metavar="N", type=int, default=1, help="Number of query threads")
+    parser.add_argument('--query-interval', metavar="N", type=int, default=5, help="N. seconds between read queries (per thread)")
     parser.add_argument('--ingester-schema', choices=('values', 'json'), metavar="C", default='values', help="Select the schema to test")
 
     options, left_over = parser.parse_known_args(args)
@@ -465,10 +697,14 @@ def main(args):
                                      batch_size, options.repeats)
 
     ingester_class = get_ingester_class(options.ingester_schema)
+    logging.info("Ingeter schema class: %s", ingester_class.__name__)
+    schema_obj = ingester_class.get_schema()
 
     logging.info("Creating DB tables")
-    ingester_class.create_schema(options)
-    logging.info("Tables ready")
+
+    with quick_cursor(options, True) as cur:
+        schema_obj.create(cur)
+    logging.info("DB ready")
 
     def input_worker(batch_reader):
         try:
@@ -478,16 +714,6 @@ def main(args):
             raise
         finally:
             results_q.append(batch_reader.get_monitor())
-
-    def writer_worker():
-        try:
-            ingester = ingester_class(options, batch_q)
-            ingester.write()
-        except Exception as e:
-            ingester.get_monitor().exception = e
-            raise
-        finally:
-            results_q.append(ingester.get_monitor())
 
     threads = []
 
@@ -499,18 +725,41 @@ def main(args):
 
         for i in range(options.num_writers):
             logging.debug("Launching writer thread %d", i)
-            t = threading.Thread(target=writer_worker)
+            t = ingester_class(options, batch_q)
             threads.append(t)
             t.start()
+
+        for i in range(options.num_query):
+            time.sleep(2 * random.random())  # Stagger query op starts
+            query_op = QueryOperator(options, schema_obj)
+            threads.append(query_op)
+            logging.debug("Launching query thread %d", i)
+            query_op.start()
 
         logging.debug("main thread joining reader")
         threads[0].join()  # join the reading thread
         logging.debug("main thread now joining job queue")
         batch_q.join()  # wait for all batches to be processed
-    # Stop writer threads
-    logging.info("work finished.  Stopping writer threads")
+
+    logging.info("work finished.")
+
+    logging.debug("Stopping writer threads")
     for i in range(options.num_writers):
         batch_q.put(None)
+
+    logging.debug("Stopping query threads and joining all")
+    for t in threads:
+        if hasattr(t, 'stop'):
+            t.stop()
+        t.join()
+
+    logging.debug("All threads joined")
+
+    logging.debug("Collecting results")
+    # threads[0] is the reader thread, which is different from the others and has already appended its monitor
+    # to our collection
+    for t in threads[1:]:
+        results_q.append(t.get_monitor())
 
     logging.debug("Checking for errors")
     for mon in results_q:
@@ -519,34 +768,12 @@ def main(args):
             logging.exception(mon.exception)
             sys.exit(1)
 
-    logging.debug("Getting table and index sizes from DB")
-    with quick_cursor(options) as cur:
-        size_threshold = 1000000  # we filter all relations and indexes smaller than this value
-        query = """
-            SELECT nspname || '.' || relname AS "relation",
-                 pg_relation_size(C.oid) AS "size"
-               FROM pg_class C
-               LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
-               WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > {}
-               ORDER BY pg_relation_size(C.oid) DESC;""".format(size_threshold)
-        #  WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > 1000000
-        cur.execute(query)
-        rows = cur.fetchall()
-        if len(rows) == 0:
-            logging.info("All relation sizes filtered since they are under the size threshold of %s", size_threshold)
-        for row in rows:
-            global_monitor.collect_value(row[0], row[1])
-        global_monitor.collect_value("total size", sum( r[1] for r in rows ))
+    report_table_sizes(options, global_monitor)
 
     logging.info("Preparing output")
     results_q.append(global_monitor)
 
-    logging.info("Writing output file %s", options.output)
-    with open(options.output, 'w') as f:
-        json.dump([ m.to_dict() for m in results_q ], f)
-
-    for monitor in results_q:
-        logging.info(monitor.write_summary())
+    write_output(options.output, results_q)
 
     with quick_cursor(options) as cur:
         # Get hypertable sizes from TimescaleDB
