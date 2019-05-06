@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import fileinput
 import logging
 import json
 import os
 import psycopg2
 import psycopg2.extras  # need to import this explicitly
+import statistics
 import sys
 import threading
 import time
@@ -16,31 +18,6 @@ from queue import Queue
 
 if psycopg2.__version__ < '2.7':
     raise ImportError("psycopg2 version >= 2.7 is required")
-
-
-other_sql = """
-
-create table metric_type (
-    metric_category text not null,
-    metric_type text not null,
-    primary key (metric_category, metric_type)
-);
-
-create table sensor (
-    sensor_uuid text not null primary key
-);
-
-create table reading (
-    time timestamp not null,
-    sensor_uuid text not null references sensor(sensor_uuid),
-    metric_category not null  references metric_type(metric_category),
-    metric_type text not null references metric_type(metric_type),
-    reading_number real,
-    tiledb text,
-    tiledb_coord text,
-    check(reading_value is not null or (tiledb is not null and tiledb_coord is not null)
-);
-"""
 
 
 class Monitor(object):
@@ -64,6 +41,18 @@ class Monitor(object):
             counters=self._counters,
             timings=self._timings,
             values=self._values)
+
+    def load_from_dict(self, values_dictionary):
+        if set( ('counters', 'timings', 'values') ) <= values_dictionary.keys():
+            self._counters.clear()
+            self._counters.update(values_dictionary['counters'])
+            self._timings.clear()
+            self._timings.update(values_dictionary['timings'])
+            self._values.clear()
+            self._values.update(values_dictionary['values'])
+            return self
+        else:
+            raise ValueError("data dictionary does not contain all required keys")
 
     def start(self, event_name):
         self._start_times[event_name] = time.time()
@@ -89,6 +78,34 @@ class Monitor(object):
     def each_value_list(self):
         for k, v in self._values.items():
             yield k, v
+
+    def write_summary(self):
+        sary = []
+
+        if len(self._counters) > 0:
+            sary.append("Counters:")
+            for name, count in self._counters.items():
+                sary.append("    {}: {}".format(name, count))
+
+        def write_collection(values_dict):
+            result = []
+            for name, values in values_dict.items():
+                result.append("    {}: n={}; mean={}; stdev={}; sum={}".format(
+                    name, len(values),
+                    "{:0.3f}".format(statistics.mean(values)) if len(values) > 0 else "n/a",
+                    "{:0.3f}".format(statistics.stdev(values)) if len(values) > 1 else "n/a",
+                    "{:0.3f}".format(sum(values))))
+            return result
+
+        if len(self._timings) > 0:
+            sary.append("Timings:")
+            sary.extend(write_collection(self._timings))
+
+        if len(self._values) > 0:
+            sary.append("Values:")
+            sary.extend(write_collection(self._values))
+
+        return "\n".join(sary)
 
     class TimingBlock(object):
         def __init__(self, monitor, event_name):
@@ -180,6 +197,24 @@ class DBIngester(object):
             password=db_connection_params.password)
         self._monitor = Monitor()
 
+    @classmethod
+    def create_schema(cls, db_connection_params):
+        logging.info("Connecting to DB")
+        conn = psycopg2.connect(
+            host=db_connection_params.host,
+            port=db_connection_params.port,
+            dbname=db_connection_params.dbname,
+            user=db_connection_params.username,
+            password=db_connection_params.password)
+        try:
+            logging.info("Executing schema SQL")
+            with conn.cursor() as cur:
+                cur.execute(cls.schema_sql())
+            conn.commit()
+            logging.info("Tables created")
+        finally:
+            conn.close()
+
     def write(self):
         try:
             while True:
@@ -204,25 +239,73 @@ class DBIngester(object):
         return self._monitor
 
 
+@contextlib.contextmanager
+def quick_cursor(db_connection_params):
+    logging.debug("Connecting to DB")
+    conn = psycopg2.connect(
+        host=db_connection_params.host,
+        port=db_connection_params.port,
+        dbname=db_connection_params.dbname,
+        user=db_connection_params.username,
+        password=db_connection_params.password)
+    try:
+        yield conn.cursor()
+    finally:
+        conn.close()
+
+
+def pretty_print_json_results(json_filename):
+    with open(json_filename) as f:
+        data = json.load(f)
+    for element in data:
+        m = Monitor().load_from_dict(element)
+        print(m.write_summary())
+
+
 class DBIngesterSchemaJson(DBIngester):
-    create_schema_sql = """
+    @classmethod
+    def schema_sql():
+        return """
     CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
     drop table if exists reading cascade;
     drop table if exists source cascade;
+    drop table if exists reading_type cascade;
+    drop table if exists reading_category cascade;
+
+    create table reading_category (
+        category text not null,
+        primary key(category),
+        constraint category_lowercase check (category = lower(category))
+    );
+
+    insert into reading_category values ('environment');
+
+    create table reading_type (
+        category text not null references reading_category(category),
+        reading_type text not null,
+        primary key (category, reading_type),
+        constraint type_lowercase check (reading_type = lower(reading_type))
+    );
+    insert into reading_type (category, reading_type) values
+        ('environment', 'humidity'),
+        ('environment', 'radiation_level'),
+        ('environment', 'ambient_temperature'),
+        ('environment', 'photosensor');
+
 
     create table source (
-        sensor_uuid text primary key
+        source_id text not null primary key
     );
 
     create table reading (
         time timestamp(0) not null,
-        sensor_uuid text not null references source,
+        source_id text not null references source,
         data jsonb,
         tiledb text,
         tiledb_coord text,
         constraint check_payload check (data is not null or (tiledb is not null and tiledb_coord is not null))
     );
-    insert into source (sensor_uuid) values
+    insert into source (source_id) values
         ('probe-0'),
         ('probe-1'),
         ('probe-2'),
@@ -242,38 +325,18 @@ class DBIngesterSchemaJson(DBIngester):
 
     --select create_hypertable('reading', 'time', chunk_time_interval => interval '1 day');
     select create_hypertable('reading', 'time', create_default_indexes => false, chunk_time_interval => interval '1 day');
-    create index on reading (sensor_uuid, time DESC);
-    """
-
-    def create_schema(db_connection_params):
-        logging.info("Connecting to DB")
-        conn = psycopg2.connect(
-            host=db_connection_params.host,
-            port=db_connection_params.port,
-            dbname=db_connection_params.dbname,
-            user=db_connection_params.username,
-            password=db_connection_params.password)
-        try:
-            logging.info("Executing schema SQL")
-            with conn.cursor() as cur:
-                cur.execute(DBIngesterSchemaJson.create_schema_sql)
-            conn.commit()
-            logging.info("Tables created")
-        finally:
-            conn.close()
-
-    def __init__(self, db_connection_params, q):
-        super(DBIngesterSchemaJson, self).__init__(db_connection_params, q)
+    create index on reading (source_id, time DESC);
+        """
 
     def _insert_batch(self, batch):
-        logging.debug("Inserting batch")
+        logging.debug("Inserting DBIngesterSchemaJson batch")
 
         def _make_tuple(item):
             ts = item.pop('timestamp')
             sensor = item.pop('sensor_uuid')
             return (ts, sensor, psycopg2.extras.Json(item))
 
-        sql = "insert into reading (time, sensor_uuid, data) values %s"
+        sql = "insert into reading (time, source_id, data) values %s"
         tuples = [ _make_tuple(item) for item in batch ]
         template = "(to_timestamp(%s), %s, %s)"
         with self._monitor.time_block("insert query time"):
@@ -282,12 +345,93 @@ class DBIngesterSchemaJson(DBIngester):
             self._conn.commit()
 
 
+class DBIngesterSchemaValues(DBIngester):
+    def schema_sql():
+        q = """
+    CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+    drop table if exists reading cascade;
+    drop table if exists source cascade;
+    drop table if exists reading_type cascade;
+    drop table if exists reading_category cascade;
+
+    create table reading_category (
+        category text not null,
+        primary key(category),
+        constraint category_lowercase check (category = lower(category))
+    );
+
+    insert into reading_category values ('environment');
+
+    create table reading_type (
+        category text not null references reading_category(category),
+        reading_type text not null,
+        primary key (category, reading_type),
+        constraint type_lowercase check (reading_type = lower(reading_type))
+    );
+    insert into reading_type (category, reading_type) values
+        ('environment', 'humidity'),
+        ('environment', 'radiation_level'),
+        ('environment', 'ambient_temperature'),
+        ('environment', 'photosensor');
+
+    create table source (
+        source_id text not null,
+        reading_category text not null,
+        reading_type text not null,
+        primary key (source_id),
+        foreign key (reading_category, reading_type) references reading_type(category, reading_type)
+    );
+
+    create table reading (
+        time timestamp(0) not null,
+        source_id text not null references source,
+        value real,
+        tiledb text,
+        tiledb_coord text,
+        constraint check_payload check (value is not null or (tiledb is not null and tiledb_coord is not null))
+    );
+
+    --select create_hypertable('reading', 'time', chunk_time_interval => interval '1 day');
+    select create_hypertable('reading', 'time', create_default_indexes => false, chunk_time_interval => interval '1 day');
+    create index on reading (source_id, time DESC);
+    insert into source (source_id, reading_category, reading_type) values
+        """
+        rtypes = [ 'humidity', 'radiation_level', 'ambient_temperature', 'photosensor' ]
+        sources = [ "('probe-{:x}-{}', 'environment', '{}')".format(n, t[0:1], t) for n in range(16) for t in rtypes ]
+        q += ",\n".join(sources) + ";"
+        return q
+
+    def _insert_batch(self, batch):
+        logging.debug("Inserting DBIngesterSchemaValues batch")
+
+        def _make_tuples(item):
+            ts = item.pop('timestamp')
+            sensor = item.pop('sensor_uuid')
+            return [ (ts, "{}-{}".format(sensor, key[0:1]), value) for key, value in item.items() ]
+
+        sql = "insert into reading (time, source_id, value) values %s"
+        tuples = [ t for item in batch for t in _make_tuples(item) ]
+        template = "(to_timestamp(%s), %s, %s)"
+        with self._monitor.time_block("insert query time"):
+            with self._conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, sql, tuples, template=template, page_size=500)
+            self._conn.commit()
+
+
+def get_ingester_class(choice_text):
+    if choice_text == 'values':
+        return DBIngesterSchemaValues
+    elif choice_text == 'json':
+        return DBIngesterSchemaJson
+    else:
+        raise ValueError("Unknown ingester selection values")
+
+
 def main(args):
     logging.basicConfig(level=logging.DEBUG)
 
     batch_size = 5000
     max_queue_length = 5
-    num_writer_threads = 1
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-j', '--host', metavar="HOST", required=True, help="DB host")
@@ -297,13 +441,16 @@ def main(args):
     parser.add_argument('-W', '--password', metavar="PASSWORD", required=True, help="DB password")
     parser.add_argument('-o', '--output', metavar="OUTPUT", required=True, help="File to which to write resulting stats")
     parser.add_argument('-r', '--repeats', metavar="N", type=int, default=1, help="how many times to repeat the input data")
+    parser.add_argument('-w', '--num-writers', metavar="N", type=int, default=1, help="Number of writer threads")
+    parser.add_argument('-q', '--num-query', metavar="N", type=int, default=1, help="Number of query threads")
+    parser.add_argument('--ingester-schema', choices=('values', 'json'), metavar="C", default='values', help="Select the schema to test")
 
     options, left_over = parser.parse_known_args(args)
     logging.debug("Options: %s", options)
     logging.debug("left_over: %s", left_over)
 
-    #  if os.path.exists(options.output):
-    #      parser.error(2, "output file {} already exists. Won't overwrite".format(options.output))
+    if os.path.exists(options.output):
+        parser.error("output file {} already exists. Won't overwrite".format(options.output))
 
     # Test write to make sure it works
     with open(options.output, 'w'):
@@ -317,8 +464,10 @@ def main(args):
     reader = JsonLineFileInputReader(batch_q, left_over if left_over else None,
                                      batch_size, options.repeats)
 
+    ingester_class = get_ingester_class(options.ingester_schema)
+
     logging.info("Creating DB tables")
-    DBIngesterSchemaJson.create_schema(options)
+    ingester_class.create_schema(options)
     logging.info("Tables ready")
 
     def input_worker(batch_reader):
@@ -332,7 +481,7 @@ def main(args):
 
     def writer_worker():
         try:
-            ingester = DBIngesterSchemaJson(options, batch_q)
+            ingester = ingester_class(options, batch_q)
             ingester.write()
         except Exception as e:
             ingester.get_monitor().exception = e
@@ -348,7 +497,7 @@ def main(args):
         t.start()
         threads.append(t)
 
-        for i in range(num_writer_threads):
+        for i in range(options.num_writers):
             logging.debug("Launching writer thread %d", i)
             t = threading.Thread(target=writer_worker)
             threads.append(t)
@@ -360,7 +509,7 @@ def main(args):
         batch_q.join()  # wait for all batches to be processed
     # Stop writer threads
     logging.info("work finished.  Stopping writer threads")
-    for i in range(num_writer_threads):
+    for i in range(options.num_writers):
         batch_q.put(None)
 
     logging.debug("Checking for errors")
@@ -370,12 +519,44 @@ def main(args):
             logging.exception(mon.exception)
             sys.exit(1)
 
+    logging.debug("Getting table and index sizes from DB")
+    with quick_cursor(options) as cur:
+        size_threshold = 1000000  # we filter all relations and indexes smaller than this value
+        query = """
+            SELECT nspname || '.' || relname AS "relation",
+                 pg_relation_size(C.oid) AS "size"
+               FROM pg_class C
+               LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
+               WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > {}
+               ORDER BY pg_relation_size(C.oid) DESC;""".format(size_threshold)
+        #  WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > 1000000
+        cur.execute(query)
+        rows = cur.fetchall()
+        if len(rows) == 0:
+            logging.info("All relation sizes filtered since they are under the size threshold of %s", size_threshold)
+        for row in rows:
+            global_monitor.collect_value(row[0], row[1])
+        global_monitor.collect_value("total size", sum( r[1] for r in rows ))
+
     logging.info("Preparing output")
     results_q.append(global_monitor)
 
     logging.info("Writing output file %s", options.output)
     with open(options.output, 'w') as f:
         json.dump([ m.to_dict() for m in results_q ], f)
+
+    for monitor in results_q:
+        logging.info(monitor.write_summary())
+
+    with quick_cursor(options) as cur:
+        # Get hypertable sizes from TimescaleDB
+        # These values are already included in the counts, but they're pretty-printed here
+        query = "select table_name, table_size, index_size from timescaledb_information.hypertable;"
+        cur.execute(query)
+        rows = cur.fetchall()
+        for row in rows:
+            logging.info("hypertable.%s.table_size = %s", row[0], row[1])
+            logging.info("hypertable.%s.index_size = %s", row[0], row[2])
 
 
 if __name__ == '__main__':
