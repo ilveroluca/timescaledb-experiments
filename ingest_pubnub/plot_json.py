@@ -27,7 +27,9 @@ def collect_data(filename):
 
     result = dict()
 
-    m = mdict['DBIngesterSchemaJson']
+    m = mdict.get('DBIngesterSchemaJson', mdict.get('DBIngesterSchemaValues'))
+    if m is None:
+        raise RuntimeError("DBIngesterSchemaJson and DBIngesterSchemaValues are missing from data")
 
     for label in ("inserts thus far", "inserts/sec"):
         result[label] = transpose(m.get_values(label))
