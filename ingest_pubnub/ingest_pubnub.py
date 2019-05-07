@@ -715,8 +715,13 @@ def get_ingester_class(choice_text):
 def main(args):
     logging.basicConfig(level=logging.DEBUG)
 
-    batch_size = 5000
     max_queue_length = 5
+
+    def int_ge1(x):
+        x = int(x)
+        if x < 1:
+            raise argparse.ArgumentTypeError("Argument must be >= 1")
+        return x
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-j', '--host', metavar="HOST", required=True, help="DB host")
@@ -725,9 +730,10 @@ def main(args):
     parser.add_argument('-U', '--username', metavar="USERNAME", required=True, help="DB username")
     parser.add_argument('-W', '--password', metavar="PASSWORD", required=True, help="DB password")
     parser.add_argument('-o', '--output', metavar="OUTPUT", required=True, help="File to which to write resulting stats")
-    parser.add_argument('-r', '--repeats', metavar="N", type=int, default=1, help="how many times to repeat the input data")
-    parser.add_argument('-w', '--num-writers', metavar="N", type=int, default=1, help="Number of writer threads")
-    parser.add_argument('-q', '--num-query', metavar="N", type=int, default=1, help="Number of query threads")
+    parser.add_argument('-r', '--repeats', metavar="N", type=int_ge1, default=1, help="how many times to repeat the input data")
+    parser.add_argument('-w', '--num-writers', metavar="N", type=int_ge1, default=1, help="Number of writer threads")
+    parser.add_argument('-q', '--num-query', metavar="N", type=int_ge1, default=1, help="Number of query threads")
+    parser.add_argument('-b', '--batch-size', metavar="N", type=int_ge1, default=5000, help="Input record batch size used for inserts")
     parser.add_argument('--query-interval', metavar="N", type=int, default=5, help="N. seconds between read queries (per thread)")
     parser.add_argument('--ingester-schema', choices=('values', 'json'), metavar="C", default='values', help="Select the schema to test")
 
@@ -748,7 +754,7 @@ def main(args):
 
     logging.debug("Creating reader")
     reader = JsonLineFileInputReader(batch_q, left_over if left_over else None,
-                                     batch_size, options.repeats)
+                                     options.batch_size, options.repeats)
 
     ingester_class = get_ingester_class(options.ingester_schema)
     logging.info("Ingeter schema class: %s", ingester_class.__name__)
