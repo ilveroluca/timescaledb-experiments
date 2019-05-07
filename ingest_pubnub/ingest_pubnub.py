@@ -662,6 +662,8 @@ class QueryOperator(DBOperator, threading.Thread):
                         logging.info("Fetched %s rows", len(rows))
                         rows = None
                 self._stop_event.wait(self._interval)
+            with self._conn.cursor() as cur:
+                report_table_sizes(cur, self._monitor)
         logging.debug("Query operator exiting")
 
     def run(self):
@@ -672,25 +674,24 @@ class QueryOperator(DBOperator, threading.Thread):
             raise
 
 
-def report_table_sizes(db_conn_options, monitor):
+def report_table_sizes(cur, monitor):
     logging.debug("Getting table and index sizes from DB")
-    with quick_cursor(db_conn_options) as cur:
-        size_threshold = 1000000  # we filter all relations and indexes smaller than this value
-        query = """
-            SELECT nspname || '.' || relname AS "relation",
-                 pg_relation_size(C.oid) AS "size"
-               FROM pg_class C
-               LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
-               WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > {}
-               ORDER BY pg_relation_size(C.oid) DESC;""".format(size_threshold)
-        #  WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > 1000000
-        cur.execute(query)
-        rows = cur.fetchall()
-        if len(rows) == 0:
-            logging.info("All relation sizes filtered since they are under the size threshold of %s", size_threshold)
-        for row in rows:
-            monitor.collect_value(row[0], row[1])
-        monitor.collect_value("total size", sum( r[1] for r in rows ))
+    size_threshold = 1000000  # we filter all relations and indexes smaller than this value
+    query = """
+        SELECT nspname || '.' || relname AS "relation",
+             pg_relation_size(C.oid) AS "size"
+           FROM pg_class C
+           LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
+           WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > {}
+           ORDER BY pg_relation_size(C.oid) DESC;""".format(size_threshold)
+    #  WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND pg_relation_size(C.oid) > 1000000
+    cur.execute(query)
+    rows = cur.fetchall()
+    if len(rows) == 0:
+        logging.info("All relation sizes filtered since they are under the size threshold of %s", size_threshold)
+    for row in rows:
+        monitor.collect_value(row[0], row[1])
+    monitor.collect_value("total size", sum( r[1] for r in rows ))
 
 
 def write_output(filename, all_monitors):
@@ -821,7 +822,8 @@ def main(args):
             logging.exception(mon.exception)
             sys.exit(1)
 
-    report_table_sizes(options, global_monitor)
+    with quick_cursor(options) as cur:
+        report_table_sizes(cur, global_monitor)
 
     logging.info("Preparing output")
     results_q.append(global_monitor)
