@@ -22,7 +22,8 @@ if psycopg2.__version__ < '2.7':
 
 
 class Monitor(object):
-    def __init__(self):
+    def __init__(self, name=None):
+        self._name = name
         self._counters = defaultdict(int)
         self._start_times = {}
         self._timings = defaultdict(list)
@@ -37,8 +38,13 @@ class Monitor(object):
     def exception(self, v):
         self._exception = v
 
+    @property
+    def name(self):
+        return self._name
+
     def to_dict(self):
         return dict(
+            name=self._name,
             counters=self._counters,
             timings=self._timings,
             values=self._values)
@@ -51,23 +57,53 @@ class Monitor(object):
             self._timings.update(values_dictionary['timings'])
             self._values.clear()
             self._values.update(values_dictionary['values'])
-            return self
         else:
             raise ValueError("data dictionary does not contain all required keys")
+
+        self._name = values_dictionary.get("name")
+        return self
+
+    @staticmethod
+    def from_dict(d):
+        m = Monitor()
+        m.load_from_dict(d)
+        return m
 
     def start(self, event_name):
         self._start_times[event_name] = time.time()
 
     def stop(self, event_name):
-        delta = time.time() - self._start_times[event_name]
-        self._timings[event_name].append(delta)
+        stop_time = time.time()
+        delta = stop_time - self._start_times[event_name]
+        self._timings[event_name].append( (stop_time, delta) )
         return delta
 
     def collect_value(self, event_name, value):
-        self._values[event_name].append(value)
+        self._values[event_name].append( (time.time(), value) )
 
     def count(self, event_name, value=1):
         self._counters[event_name] += value
+
+    @property
+    def counter_names(self):
+        return self._counters.keys()
+
+    @property
+    def value_names(self):
+        return self._values.keys()
+
+    @property
+    def timing_names(self):
+        return self._timing.keys()
+
+    def get_count(self, event_name):
+        return self._counters.get(event_name, 0)
+
+    def get_values(self, name):
+        return self._values.get(name, [])
+
+    def get_timings(self, name):
+        return self._timings.get(name, [])
 
     def has_counter(self, event_name):
         event_name in self._counters
@@ -80,8 +116,14 @@ class Monitor(object):
         for k, v in self._values.items():
             yield k, v
 
+    def each_timing_list(self):
+        for k, v in self._timings.items():
+            yield k, v
+
     def write_summary(self):
         sary = []
+        if self._name:
+            sary.append("Monitor: {}".format(self._name))
 
         if len(self._counters) > 0:
             sary.append("Counters:")
@@ -90,12 +132,12 @@ class Monitor(object):
 
         def write_collection(values_dict):
             result = []
-            for name, values in values_dict.items():
+            for name, ary in values_dict.items():
                 result.append("    {}: n={}; mean={}; stdev={}; sum={}".format(
-                    name, len(values),
-                    "{:0.3f}".format(statistics.mean(values)) if len(values) > 0 else "n/a",
-                    "{:0.3f}".format(statistics.stdev(values)) if len(values) > 1 else "n/a",
-                    "{:0.3f}".format(sum(values))))
+                    name, len(ary),
+                    "{:0.3f}".format(statistics.mean( t[1] for t in ary )) if len(ary) > 0 else "n/a",
+                    "{:0.3f}".format(statistics.stdev( t[1] for t in ary )) if len(ary) > 1 else "n/a",
+                    "{:0.3f}".format(sum( t[1] for t in ary ))))
             return result
 
         if len(self._timings) > 0:
@@ -151,7 +193,7 @@ def pretty_print_json_results(json_filename):
     with open(json_filename) as f:
         data = json.load(f)
     for element in data:
-        m = Monitor().load_from_dict(element)
+        m = Monitor.from_dict(element)
         print(m.write_summary())
 
 
@@ -161,7 +203,12 @@ class JsonLineFileInputReader(object):
         self._files = files if files else ["-"]
         self._batch_size = batch_size
         self._repeats = repeat_input_times
-        self._monitor = Monitor()
+        self._monitor = Monitor("JsonLineFileInputReader")
+
+        if self._repeats > 1 and self._files == ["-"]:
+            raise ValueError("Repeats different from 1 are not supported when reading from stdin")
+        if self._repeats < 1:
+            raise ValueError("Repeats must be >= 1 (got {})".format(self._repeats))
 
     def read(self):
         batch = []
@@ -230,14 +277,19 @@ class DBSchema(object):
 
 
 class DBOperator(object):
-    def __init__(self, db_connection_params):
+    def __init__(self, db_connection_params, name=None):
         self._conn = psycopg2.connect(
             host=db_connection_params.host,
             port=db_connection_params.port,
             dbname=db_connection_params.dbname,
             user=db_connection_params.username,
             password=db_connection_params.password)
-        self._monitor = Monitor()
+
+        if name:
+            monitor_name = name
+        else:
+            monitor_name = type(self).__name__
+        self._monitor = Monitor(monitor_name)
 
     def close(self):
         if self._conn is not None:
@@ -249,8 +301,8 @@ class DBOperator(object):
 
 
 class DBIngester(DBOperator, threading.Thread):
-    def __init__(self, db_connection_params, q):
-        DBOperator.__init__(self, db_connection_params)
+    def __init__(self, db_connection_params, q, name=None):
+        DBOperator.__init__(self, db_connection_params, name)
         threading.Thread.__init__(self)
         self._q = q
 
@@ -571,7 +623,7 @@ class DBIngesterSchemaValues(DBIngester):
 
 
 class QueryOperator(DBOperator, threading.Thread):
-    def __init__(self, db_connection_params, schema_obj):
+    def __init__(self, db_connection_params, schema_obj, name=None):
         DBOperator.__init__(self, db_connection_params)
         threading.Thread.__init__(self)
         self._schema_obj = schema_obj
