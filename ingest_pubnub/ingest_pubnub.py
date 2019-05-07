@@ -317,6 +317,7 @@ class DBIngester(DBOperator, threading.Thread):
                     self._insert_batch(batch)
                     delta = self._monitor.stop("insert time")
                     self._monitor.count("records inserted", len(batch))
+                    self._monitor.collect_value("inserts thus far", self._monitor.get_count("records inserted"))
                     self._monitor.collect_value("inserts/sec", len(batch) / delta )
                 finally:
                     self._q.task_done()
