@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import fileinput
+import heapq
 import logging
 import json
 import os
@@ -62,6 +63,40 @@ class Monitor(object):
 
         self._name = values_dictionary.get("name")
         return self
+
+    def _merge_time_lists(self, list1, list2):
+        return [ x for x in heapq.merge(list1, list2, key=lambda r: r[0]) ]
+
+    def _merge_time_dicts(self, d1, d2):
+        new_dict = defaultdict(list)
+        for k in d1:
+            if k in d2:
+                new_dict[k] = self._merge_time_lists(d1[k], d2[k])
+            else:
+                new_dict[k] = d1[k]
+        for k in d2:
+            if k not in new_dict:
+                new_dict[k] = d2[k]
+
+        return new_dict
+
+    def _merge_counters(self, other):
+        new_dict = defaultdict(int)
+        for k in self._counters.keys():
+            if k in other._counters:
+                new_dict[k] = self._counters[k] + other._counters[k]
+            else:
+                new_dict[k] = self._counters[k]
+        for k in other._counters.keys():
+            if k not in self._counters:
+                new_dict[k] = other._counters[k]
+
+        self._counters = new_dict
+
+    def merge(self, other):
+        self._merge_counters(other)
+        self._timings = self._merge_time_dicts(self._timings, other._timings)
+        self._values = self._merge_time_dicts(self._values, other._values)
 
     @staticmethod
     def from_dict(d):
@@ -757,7 +792,7 @@ def main(args):
                                      options.batch_size, options.repeats)
 
     ingester_class = get_ingester_class(options.ingester_schema)
-    logging.info("Ingeter schema class: %s", ingester_class.__name__)
+    logging.info("Ingester schema class: %s", ingester_class.__name__)
     schema_obj = ingester_class.get_schema()
 
     logging.info("Creating DB tables")

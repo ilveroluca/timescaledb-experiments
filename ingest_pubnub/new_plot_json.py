@@ -55,11 +55,22 @@ def map_timeseries_to_table_size(sorted_inserts_thus_far, sorted_timeseries):
             ts_idx += 1
 
 
-def collect_data(filename):
+def load_monitors(filename):
     with open(filename) as f:
         data = json.load(f)
-    mdict = dict( [ (d['name'], Monitor.from_dict(d)) for d in data ] )
 
+    mdict = dict()
+    for d in data:
+        m = Monitor.from_dict(d)
+        if m.name in mdict:
+            mdict[m.name].merge(m)
+        else:
+            mdict[m.name] = m
+    return mdict
+
+
+def collect_data(filename):
+    mdict = load_monitors(filename)
     result = dict()
 
     m = mdict.get('DBIngesterSchemaJson', mdict.get('DBIngesterSchemaValues'))
